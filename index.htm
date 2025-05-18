@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Smart Fuel Navigation</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine/dist/leaflet-routing-machine.css" />
+  <style>
+    body, html { margin: 0; padding: 0; height: 100%; }
+    #map { height: 100%; }
+    .controls {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: white;
+      padding: 10px;
+      border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+      z-index: 1000;
+    }
+    .controls input, .controls button {
+      margin: 5px 0;
+      padding: 8px;
+      width: 200px;
+      font-size: 14px;
+    }
+    .modal {
+      position: fixed;
+      top: 20%;
+      left: 50%;
+      transform: translateX(-50%);
+      background: white;
+      border: 2px solid #444;
+      padding: 20px;
+      border-radius: 10px;
+      z-index: 9999;
+      display: none;
+      max-width: 500px;
+    }
+    .modal h3 { margin-top: 0; }
+    .modal ul { list-style: none; padding: 0; }
+    .modal li {
+      margin: 10px 0;
+      cursor: pointer;
+      color: blue;
+      text-decoration: underline;
+    }
+    .modal .alert { color: red; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="controls">
+    <input type="text" id="destinationInput" placeholder="Enter destination..." />
+    <button onclick="searchDestination()">Navigate</button><br><br>
+    <input type="number" id="currentFuel" value="10" step="0.1" placeholder="Current Fuel (liters)" /><br>
+    <button onclick="simulateFuelUse()">Simulate Fuel Use (50 km)</button>
+  </div>
+  <div id="map"></div>
+  <div id="modal" class="modal"></div>
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-routing-machine/dist/leaflet-routing-machine.js"></script>
+  <script>
+    // Fuel Tracker Configuration
+    const tankCapacity = 50; // liters
+    const fuelEfficiency = 15; // km/liter
+    const lowFuelThreshold = 0.1; // 10% of tank capacity
+    let currentFuel = parseFloat(document.getElementById('currentFuel').value) || 10;
+    let map = L.map('map', {
+      zoomControl: false // Disable default zoom control (top-left)
+    }).setView([20.5937, 78.9629], 5); // India center
+
+    // Add zoom control to top-right
+    L.control.zoom({ position: 'topright' }).addTo(map);
+
+    let userLocation = null;
+    let routingControl;
+    let speechEnabled = true;
+
+    // Map Tiles
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    // Get User Location
+    navigator.geolocation.getCurrentPosition(pos => {
+      userLocation = [pos.coords.latitude, pos.coords.longitude];
+      map.setView(userLocation, 15);
+      L.marker(userLocation).addTo(map).bindPopup("You are here").openPopup();
+    }, err => {
+      showModal("Location access denied. Cannot navigate properly without location.");
+    });
+
+    // Fuel Tracker Logic
+    function calculateMaxDistance() {
+      return currentFuel * fuelEfficiency;
+    }
+
+    function checkLowFuel() {
+      const thresholdLevel = tankCapacity * lowFuelThreshold;
+      if (currentFuel <= thresholdLevel) {
+        return `ALERT: Low fuel! Only ${currentFuel.toFixed(1)} liters left. Find a petrol station soon!`;
+      }
+      return null;
+    }
+
+    async function findNearestPetrolStation() {
+      if (!userLocation) {
+        return { message: "Waiting for location...", station: null };
+      }
+      const overpassQuery = `
+        [out:json];
+        (
+          node["amenity"="fuel"](around:5000,${userLocation[0]},${userLocation[1]});
+        );
+        out center;
+      `;
+      const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(overpassQuery)}`;
+      const res = await fetch(url);
+      const data = await res.json();
+
+      if (!data.elements.length) {
+        return { message: "No petrol stations found nearby.", station: null };
+      }
+
+      let nearestStation = null;
+      let minDistance = Infinity;
+      data.elements.forEach(el => {
+        const distance = haversineDistance(userLocation[0], userLocation[1], el.lat, el.lon);
+        if (distance < minDistance) {
+          minDistance = distance;
+          nearestStation = { name: el.tags.name || "Unnamed", lat: el.lat, lon: el.lon };
+        }
+      });
+
+      return {
+        message: `Nearest petrol station: ${nearestStation.name} (${minDistance.toFixed(1)} km away)`,
+        station: nearestStation
+      };
+    }
+
+    function haversineDistance(lat1, lon1, lat2, lon2) {
+      const R = 6371; // Earth's radius in km
+      const dLat = (lat2 - lat1) * Math.PI / 180;
+      const dLon = (lon2 - lon1) * Math.PI / 180;
+      const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                Math.sin(dLon / 2) * Math.sin(dLon / 2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
+
+    async function estimateDestination(distance) {
+      const maxDistance = calculateMaxDistance();
+      const results = [
+        `Current fuel: ${currentFuel.toFixed(1)} liters`,
+        `Max travel distance: ${maxDistance.toFixed(1)} km`,
+        `Destination distance: ${distance.toFixed(1)} km`
+      ];
+
+      let nearest = { message: "", station: null };
+      if (maxDistance < distance || checkLowFuel()) {
+        nearest = await findNearestPetrolStation();
+        results.push(nearest.message);
+      }
+
+      if (maxDistance >= distance) {
+        results.push("You have enough fuel to reach your destination.");
+        results.push(`Remaining fuel after destination: ${((maxDistance - distance) / fuelEfficiency).toFixed(1)} liters`);
+      } else {
+        results.push("WARNING: Not enough fuel to reach destination!");
+        results.push(`Fuel needed: ${((distance - maxDistance) / fuelEfficiency).toFixed(1)} liters`);
+      }
+
+      const lowFuelAlert = checkLowFuel();
+      if (lowFuelAlert) {
+        results.push(lowFuelAlert);
+      }
+
+      return { results, nearestStation: nearest.station };
+    }
+
+    function simulateFuelUse() {
+      const fuelUsed = 3.33; // 50 km / 15 km/L
+      currentFuel = Math.max(0, currentFuel - fuelUsed);
+      document.getElementById('currentFuel').value = currentFuel.toFixed(1);
+      showModal(`Fuel used: ${fuelUsed.toFixed(2)} liters. Current fuel: ${currentFuel.toFixed(1)} liters`);
+      checkFuelStatus();
+    }
+
+    async function checkFuelStatus() {
+      const lowFuelAlert = checkLowFuel();
+      if (lowFuelAlert) {
+        const nearest = await findNearestPetrolStation();
+        const message = `${lowFuelAlert}<br>${nearest.message}`;
+        showModal(message, nearest.station);
+      }
+    }
+
+    // Search Destination
+    async function searchDestination() {
+      const place = document.getElementById('destinationInput').value.trim();
+      if (!place) {
+        showModal("Please enter a destination!");
+        return;
+      }
+
+      const queryUrl = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(place)}, India`;
+      const res = await fetch(queryUrl);
+      const data = await res.json();
+
+      if (!data.length) {
+        showModal("Destination not found!");
+        return;
+      }
+
+      const destLatLng = [parseFloat(data[0].lat), parseFloat(data[0].lon)];
+      routeTo(destLatLng);
+    }
+
+    function closeModal() {
+      document.getElementById('modal').style.display = 'none';
+    }
+
+    function showModal(message, nearestStation = null) {
+      const modal = document.getElementById('modal');
+      let content = `<h3>Alert</h3><p class="alert">${message}</p>`;
+      if (nearestStation) {
+        content += `<p><a href="#" onclick="selectNearby(${nearestStation.lat}, ${nearestStation.lon})">Navigate to ${nearestStation.name}</a></p>`;
+      }
+      content += `<button onclick="closeModal()">Close</button>`;
+      modal.innerHTML = content;
+      modal.style.display = 'block';
+      speak(message.replace(/<br>/g, ' '));
+    }
+
+    function selectNearby(lat, lon) {
+      closeModal();
+      routeTo([lat, lon]);
+    }
+
+    // Create Route
+    async function routeTo(destLatLng) {
+      if (!userLocation) {
+        showModal("User location not available.");
+        return;
+      }
+
+      if (routingControl) {
+        map.removeControl(routingControl);
+      }
+
+      routingControl = L.Routing.control({
+        waypoints: [
+          L.latLng(userLocation[0], userLocation[1]),
+          L.latLng(destLatLng[0], destLatLng[1])
+        ],
+        routeWhileDragging: false,
+        addWaypoints: false,
+        draggableWaypoints: false,
+        lineOptions: {
+          styles: [{ color: 'blue', weight: 6 }]
+        },
+        createMarker: function(i, waypoint, n) {
+          return L.marker(waypoint.latLng, {
+            icon: L.icon({
+              iconUrl: i === 0
+                ? 'https://cdn-icons-png.flaticon.com/512/64/64113.png'
+                : 'https://cdn-icons-png.flaticon.com/512/684/684908.png',
+              iconSize: [30, 30],
+              iconAnchor: [15, 15]
+            })
+          });
+        },
+        router: new L.Routing.OSRMv1({
+          serviceUrl: 'https://router.project-osrm.org/route/v1'
+        })
+      }).on('routesfound', async function(e) {
+        const route = e.routes[0];
+        const summary = route.summary;
+        const distance = summary.totalDistance / 1000; // km
+        const time = summary.totalTime / 60; // minutes
+        speak(`Route found. Distance: ${distance.toFixed(1)} kilometers. Estimated time: ${time.toFixed(0)} minutes.`);
+
+        // Check fuel feasibility
+        const { results, nearestStation } = await estimateDestination(distance);
+        if (results.some(r => r.includes("WARNING") || r.includes("ALERT"))) {
+          showModal(results.join('<br>'), nearestStation);
+        }
+      }).on('waypointschanged', function() {
+        speak("Recalculating route...");
+      }).addTo(map);
+    }
+
+    // Voice assistant
+    function speak(message) {
+      if (!speechEnabled) return;
+      const utterance = new SpeechSynthesisUtterance(message);
+      utterance.lang = 'en-IN';
+      speechSynthesis.speak(utterance);
+    }
+
+    // Update current fuel when input changes
+    document.getElementById('currentFuel').addEventListener('change', (e) => {
+      currentFuel = parseFloat(e.target.value) || 0;
+      checkFuelStatus();
+    });
+  </script>
+</body>
+</html>
